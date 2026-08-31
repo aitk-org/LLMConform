@@ -162,7 +162,7 @@ h1 { font-size: 23px; line-height: 1.25; font-weight: 650; letter-spacing: -.028
 .model-menu {
   position: absolute;
   z-index: 20;
-  top: 66px;
+  top: 44px;
   left: 0;
   right: 130px;
   max-height: 245px;

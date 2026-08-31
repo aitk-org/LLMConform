@@ -61,17 +61,23 @@
 
   modelInput.addEventListener('keydown', (event) => {
     if (!loadedModels.length) return;
-    const options = [...modelMenu.querySelectorAll('[role="option"]')];
+    let options = [...modelMenu.querySelectorAll('[role="option"]')];
     if (event.key === 'ArrowDown') {
       event.preventDefault();
       if (modelMenu.hidden) {
         renderModelMenu('');
         setModelMenuOpen(true);
       }
+      options = [...modelMenu.querySelectorAll('[role="option"]')];
       highlightedModel = Math.min(highlightedModel + 1, options.length - 1);
       updateHighlightedModel(options);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
+      if (modelMenu.hidden) {
+        renderModelMenu('');
+        setModelMenuOpen(true);
+      }
+      options = [...modelMenu.querySelectorAll('[role="option"]')];
       highlightedModel = Math.max(highlightedModel - 1, 0);
       updateHighlightedModel(options);
     } else if (event.key === 'Enter' && highlightedModel >= 0 && options[highlightedModel]) {
@@ -122,6 +128,64 @@
       loadModelsButton.textContent = '获取模型';
     }
   });
+
+  function renderModelMenu(filter) {
+    modelMenu.replaceChildren();
+    const keyword = filter.trim().toLowerCase();
+    const matches = loadedModels.filter((model) => {
+      const id = String(model.id || '');
+      const owner = String(model.owned_by || '');
+      return !keyword || `${id} ${owner}`.toLowerCase().includes(keyword);
+    });
+    highlightedModel = -1;
+    if (matches.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'model-empty';
+      empty.textContent = keyword ? '没有匹配的模型' : '暂时没有可用模型';
+      modelMenu.append(empty);
+      return;
+    }
+    for (const model of matches) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'model-option';
+      option.setAttribute('role', 'option');
+      option.dataset.modelId = model.id;
+      option.setAttribute('aria-selected', model.id === modelInput.value ? 'true' : 'false');
+      const id = document.createElement('span');
+      id.textContent = model.id;
+      option.append(id);
+      if (model.owned_by) {
+        const owner = document.createElement('small');
+        owner.textContent = model.owned_by;
+        option.append(owner);
+      }
+      option.addEventListener('click', () => selectModel(model.id));
+      modelMenu.append(option);
+    }
+  }
+
+  function updateHighlightedModel(options) {
+    options.forEach((option, index) => {
+      const highlighted = index === highlightedModel;
+      option.classList.toggle('is-highlighted', highlighted);
+      option.setAttribute('aria-selected', highlighted ? 'true' : option.dataset.modelId === modelInput.value ? 'true' : 'false');
+    });
+    options[highlightedModel]?.scrollIntoView({block: 'nearest'});
+  }
+
+  function selectModel(modelID) {
+    modelInput.value = modelID;
+    setModelMenuOpen(false);
+  }
+
+  function setModelMenuOpen(open) {
+    const shouldOpen = Boolean(open && loadedModels.length);
+    modelMenu.hidden = !shouldOpen;
+    modelInput.setAttribute('aria-expanded', String(shouldOpen));
+    modelToggle.setAttribute('aria-expanded', String(shouldOpen));
+    modelToggle.setAttribute('aria-label', shouldOpen ? '收起模型列表' : '展开模型列表');
+  }
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
