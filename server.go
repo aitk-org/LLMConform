@@ -37,7 +37,44 @@ func serve(addr string, timeout time.Duration) error {
 	registry := &runRegistry{jobs: make(map[string]*runJob)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "catalog_version": catalogVersion})
+	})
+	mux.HandleFunc("GET /api/test-catalog", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version":  catalogVersion,
+			"profiles": allProfiles(),
+			"levels":   allLevels(),
+			"routes":   allRouteIDs(),
+		})
+	})
+	mux.HandleFunc("POST /api/preflight", func(w http.ResponseWriter, req *http.Request) {
+		req.Body = http.MaxBytesReader(w, req.Body, 1<<20)
+		var input PreflightRequest
+		decoder := json.NewDecoder(req.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		baseURL, err := normalizeBaseURL(input.BaseURL)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(req.Context(), timeout)
+		defer cancel()
+		models, modelErr := fetchModels(ctx, &http.Client{}, ModelListRequest{BaseURL: baseURL, APIKey: input.APIKey})
+		response := PreflightResponse{BaseURL: baseURL, Models: models}
+		if modelErr != nil {
+			if isOptionalModelListError(modelErr) {
+				response.Warning = "目标可以访问，但没有可用的 /v1/models；请手动填写模型。"
+				writeJSON(w, http.StatusOK, response)
+				return
+			}
+			writeAPIError(w, http.StatusBadGateway, "preflight_error", modelErr.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
 	})
 	mux.HandleFunc("POST /api/models", func(w http.ResponseWriter, req *http.Request) {
 		req.Body = http.MaxBytesReader(w, req.Body, 1<<20)
@@ -57,22 +94,27 @@ func serve(addr string, timeout time.Duration) error {
 		}
 		writeJSON(w, http.StatusOK, ModelListResponse{Models: models})
 	})
-	mux.HandleFunc("POST /api/runs", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("POST /api/run-plans", func(w http.ResponseWriter, req *http.Request) {
 		req.Body = http.MaxBytesReader(w, req.Body, 1<<20)
-		var input RunRequest
-		decoder := json.NewDecoder(req.Body)
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&input); err != nil {
+		input, ok := decodeRunRequest(w, req)
+		if !ok {
+			return
+		}
+		cfg := runConfigFromRequest(input, timeout)
+		plan, err := BuildRunPlan(cfg)
+		if err != nil {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-		cfg := RunConfig{
-			BaseURL: input.BaseURL,
-			APIKey:  input.APIKey,
-			Model:   input.Model,
-			Routes:  input.Routes,
-			Timeout: timeout,
+		writeJSON(w, http.StatusOK, plan)
+	})
+	mux.HandleFunc("POST /api/runs", func(w http.ResponseWriter, req *http.Request) {
+		req.Body = http.MaxBytesReader(w, req.Body, 1<<20)
+		input, ok := decodeRunRequest(w, req)
+		if !ok {
+			return
 		}
+		cfg := runConfigFromRequest(input, timeout)
 		if err := cfg.Validate(); err != nil {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
@@ -120,14 +162,8 @@ func serve(addr string, timeout time.Duration) error {
 
 func newRunJob(cfg RunConfig) *runJob {
 	now := time.Now().UTC()
-	report := Report{
-		ID:        newReportID(),
-		State:     StatusRunning,
-		BaseURL:   cfg.BaseURL,
-		Model:     cfg.Model,
-		StartedAt: now,
-		Progress:  Progress{Total: len(cfg.Routes) * len(allCheckIDs()), Label: "准备开始"},
-	}
+	plan, _ := BuildRunPlan(cfg)
+	report := newReport(now, plan)
 	return &runJob{report: report, listeners: make(map[chan Report]struct{})}
 }
 
@@ -198,6 +234,10 @@ func serveRunReport(w http.ResponseWriter, registry *runRegistry, id string) {
 		return
 	}
 	report := job.snapshot()
+	if report.State != StatusComplete {
+		writeAPIError(w, http.StatusConflict, "run_incomplete", "run is not complete")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", report.ID+".json"))
 	_ = json.NewEncoder(w).Encode(report)
@@ -252,6 +292,36 @@ func writeAPIError(w http.ResponseWriter, status int, errorType, message string)
 	writeJSON(w, status, map[string]any{
 		"error": map[string]string{"type": errorType, "message": message},
 	})
+}
+
+func decodeRunRequest(w http.ResponseWriter, req *http.Request) (RunRequest, bool) {
+	var input RunRequest
+	decoder := json.NewDecoder(req.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return RunRequest{}, false
+	}
+	return input, true
+}
+
+func runConfigFromRequest(input RunRequest, timeout time.Duration) RunConfig {
+	return RunConfig{
+		BaseURL: input.BaseURL,
+		APIKey:  input.APIKey,
+		Model:   input.Model,
+		Profile: input.Profile,
+		Level:   input.Level,
+		Routes:  input.Routes,
+		Timeout: timeout,
+	}
+}
+
+func isOptionalModelListError(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "HTTP 404") ||
+		strings.Contains(message, "HTTP 405") ||
+		strings.Contains(message, "没有可用的 model id")
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

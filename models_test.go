@@ -3,14 +3,14 @@ package main
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestFetchModelsUsesOpenAIListRoute(t *testing.T) {
 	t.Parallel()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
@@ -20,7 +20,6 @@ func TestFetchModelsUsesOpenAIListRoute(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"z-model","owned_by":"team"},{"id":"a-model"},{"id":"z-model"}]}`))
 	}))
-	defer server.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -35,9 +34,9 @@ func TestFetchModelsUsesOpenAIListRoute(t *testing.T) {
 
 func TestFetchModelsFallsBackToAnthropicAuth(t *testing.T) {
 	t.Parallel()
-	requests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
+	var requests atomic.Int32
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		if r.Header.Get("x-api-key") == "secret" && r.Header.Get("anthropic-version") != "" {
 			_, _ = w.Write([]byte(`{"data":[{"id":"claude-test"}]}`))
 			return
@@ -45,13 +44,12 @@ func TestFetchModelsFallsBackToAnthropicAuth(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":{"message":"use x-api-key"}}`))
 	}))
-	defer server.Close()
 
 	models, err := fetchModels(context.Background(), server.Client(), ModelListRequest{BaseURL: server.URL, APIKey: "secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != 2 || len(models) != 1 || models[0].ID != "claude-test" {
-		t.Fatalf("requests = %d, models = %+v", requests, models)
+	if requests.Load() != 2 || len(models) != 1 || models[0].ID != "claude-test" {
+		t.Fatalf("requests = %d, models = %+v", requests.Load(), models)
 	}
 }

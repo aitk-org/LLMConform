@@ -4,139 +4,145 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>LLMConform</title>
+  <title>LLMConform · 协议兼容性验证</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div class="app-shell">
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="LLMConform 首页"><span class="brand-mark">LC</span><span>LLMConform</span></a>
-      <div class="local-status"><span class="local-dot"></span><span>本地服务</span></div>
-    </header>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="LLMConform 首页"><span class="brand-mark">LC</span><span>LLMConform</span></a>
+    <div class="local-status"><span class="local-dot"></span>本地运行 · Key 不落盘</div>
+  </header>
 
-    <main class="main">
-      <div class="heading">
-        <div>
-          <h1>协议兼容性检查</h1>
-          <p>一次运行，对比三个 LLM API 路由的结构、流式和工具调用能力。</p>
+  <main class="main">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">LLM API CONFORMANCE</p>
+        <h1>先看清测试计划，再发出请求。</h1>
+        <p class="hero-copy">验证 OpenAI、Claude 与多协议网关的结构、流式事件、工具调用和错误契约。结果下钻到每一条原子断言。</p>
+      </div>
+      <ol class="steps" aria-label="测试流程">
+        <li class="is-current" data-step="target"><span>1</span>验证目标</li>
+        <li data-step="plan"><span>2</span>确认计划</li>
+        <li data-step="run"><span>3</span>执行测试</li>
+        <li data-step="result"><span>4</span>查看证据</li>
+      </ol>
+    </section>
+
+    <p class="notice notice-error" id="global-error" role="alert" hidden></p>
+
+    <section class="panel stage-panel" aria-labelledby="target-heading">
+      <div class="panel-heading">
+        <div class="stage-title"><span class="stage-number">01</span><div><h2 id="target-heading">验证测试目标</h2><p>先检查地址、鉴权和模型列表；这一步不会调用模型生成内容。</p></div></div>
+        <span class="stage-state" id="target-state">待验证</span>
+      </div>
+      <form id="target-form">
+        <div class="fields target-fields">
+          <label>服务地址
+            <input id="base-url" type="url" placeholder="https://gateway.example.com" spellcheck="false" required>
+            <small>填写服务根地址，不要包含具体接口路径</small>
+          </label>
+          <label>服务类型
+            <select id="profile">
+              <option value="gateway">多协议网关</option>
+              <option value="openai">OpenAI 兼容</option>
+              <option value="claude">Claude 兼容</option>
+              <option value="custom">自定义路由</option>
+            </select>
+            <small>用于选择默认鉴权和测试路由</small>
+          </label>
+          <label>API Key
+            <input id="api-key" type="password" placeholder="可留空" autocomplete="off">
+            <small>仅存在于当前进程内存</small>
+          </label>
+        </div>
+        <div class="panel-actions">
+          <span class="inline-message" id="preflight-message">尚未连接目标服务</span>
+          <button class="button button-primary" id="preflight-button" type="submit">验证并继续</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel stage-panel" id="plan-stage" aria-labelledby="plan-heading" hidden>
+      <div class="panel-heading">
+        <div class="stage-title"><span class="stage-number">02</span><div><h2 id="plan-heading">确认测试计划</h2><p>选择模型、测试深度和路由，然后预览请求规模与每项判断标准。</p></div></div>
+        <span class="stage-state" id="plan-state">待生成</span>
+      </div>
+
+      <div class="plan-config">
+        <div class="fields plan-fields">
+          <label>测试模型
+            <input id="model" list="model-options" autocomplete="off" placeholder="选择或手动填写 model id" spellcheck="false">
+            <datalist id="model-options"></datalist>
+            <small id="model-message">可以手动填写任意 model id</small>
+          </label>
+          <fieldset class="choice-field">
+            <legend>测试深度</legend>
+            <div class="segmented">
+              <label><input type="radio" name="level" value="quick"><span>快速<small>路由 + 基础</small></span></label>
+              <label><input type="radio" name="level" value="standard" checked><span>标准<small>完整兼容性</small></span></label>
+              <label><input type="radio" name="level" value="full"><span>完整<small>含系统 / 多轮</small></span></label>
+            </div>
+          </fieldset>
+        </div>
+        <fieldset class="route-field">
+          <legend>测试路由</legend>
+          <div class="route-options">
+            <label><input type="checkbox" name="route" value="chat" checked><span><strong>Chat Completions</strong><small>/v1/chat/completions</small></span></label>
+            <label><input type="checkbox" name="route" value="responses" checked><span><strong>Responses</strong><small>/v1/responses</small></span></label>
+            <label><input type="checkbox" name="route" value="messages" checked><span><strong>Messages</strong><small>/v1/messages</small></span></label>
+          </div>
+        </fieldset>
+        <div class="panel-actions plan-actions">
+          <span class="inline-message">生成计划不会调用模型</span>
+          <button class="button button-secondary" id="plan-button" type="button">生成测试计划</button>
         </div>
       </div>
 
-      <form class="config-panel" id="run-form">
-        <div class="section-title">
-          <h2>目标配置</h2>
-          <span>API Key 仅保留在本次运行内存中</span>
+      <div class="plan-preview" id="plan-preview" hidden>
+        <div class="metrics" id="plan-metrics"></div>
+        <div class="plan-groups" id="plan-groups"></div>
+        <div class="cost-note"><strong>执行说明</strong><span>错误场景不会产生模型调用；基础场景失败后，同一路由的流式、工具和错误场景会标记为 BLOCKED，避免无意义请求。</span></div>
+        <div class="run-confirm">
+          <label class="confirm-check"><input id="confirm-plan" type="checkbox">我已查看计划，同意向目标服务发送上述请求</label>
+          <button class="button button-primary" id="run-button" type="button" disabled>开始执行</button>
         </div>
-        <div class="fields">
-          <label>服务地址
-            <input id="base-url" name="base-url" type="url" placeholder="https://gateway.example.com" spellcheck="false" required>
-          </label>
-          <div class="field-group">
-            <label class="field-label" for="model">模型</label>
-            <div class="model-control">
-              <div class="model-picker">
-                <div class="model-input-wrap">
-                  <input id="model" name="model" autocomplete="off" placeholder="选择或手填模型" spellcheck="false" aria-autocomplete="list" aria-controls="model-menu" aria-expanded="false" required>
-                  <button class="model-toggle" id="model-toggle" type="button" aria-label="展开模型列表" aria-controls="model-menu" aria-expanded="false">⌄</button>
-                </div>
-                <button class="load-models" id="load-models" type="button">获取模型</button>
-              </div>
-              <div class="model-menu" id="model-menu" role="listbox" aria-label="模型列表" hidden></div>
-            </div>
-            <span class="field-hint" id="model-status">通过 <code>/v1/models</code> 获取，也可以直接输入</span>
+      </div>
+    </section>
+
+    <section class="panel stage-panel" id="run-stage" aria-labelledby="run-heading" hidden>
+      <div class="panel-heading">
+        <div class="stage-title"><span class="stage-number">03</span><div><h2 id="run-heading">执行测试</h2><p id="run-copy">正在准备测试运行。</p></div></div>
+        <span class="stage-state state-running" id="run-state">RUNNING</span>
+      </div>
+      <div class="progress-summary">
+        <strong id="progress-scenarios">0 / 0 场景</strong>
+        <span id="progress-assertions">0 / 0 断言</span>
+      </div>
+      <div class="progress-track" id="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-bar"></div></div>
+    </section>
+
+    <section class="results-stage" id="results-stage" aria-labelledby="results-heading" hidden>
+      <div class="verdict" id="verdict">
+        <div><p class="eyebrow">LATEST RUN</p><h2 id="results-heading">兼容性结果</h2><p id="verdict-copy"></p></div>
+        <div class="verdict-score"><strong id="verdict-title">检查中</strong><span id="run-meta"></span></div>
+      </div>
+      <div class="result-toolbar">
+        <div class="summary-chips" id="summary-chips"></div>
+        <a class="button button-secondary download" id="download-report" href="#" download hidden>下载 JSON 报告</a>
+      </div>
+      <div class="result-layout">
+        <div class="result-tree" id="result-tree" aria-label="测试结果"></div>
+        <aside class="evidence-panel" id="evidence-panel">
+          <div class="evidence-empty" id="evidence-empty"><span>↙</span><strong>选择一个测试场景</strong><p>查看原子断言、预期值、实际值和请求响应证据。</p></div>
+          <div id="evidence-content" hidden>
+            <div class="evidence-heading"><span class="status-pill" id="detail-status"></span><div><h3 id="detail-heading"></h3><p id="detail-summary"></p></div></div>
+            <div class="assertion-list" id="assertion-list"></div>
+            <div class="exchange-list" id="exchange-list"></div>
           </div>
-          <label>API Key
-            <input id="api-key" name="api-key" type="password" placeholder="可留空" autocomplete="off">
-          </label>
-        </div>
-        <div class="routes-row">
-          <fieldset class="routes">
-            <legend class="sr-only">要检查的路由</legend>
-            <label class="route-check"><input type="checkbox" name="route" value="chat" checked> Chat Completions</label>
-            <label class="route-check"><input type="checkbox" name="route" value="responses" checked> Responses</label>
-            <label class="route-check"><input type="checkbox" name="route" value="messages" checked> Messages</label>
-          </fieldset>
-          <button class="run-button" id="run-button" type="submit">开始检查</button>
-        </div>
-        <p class="form-error" id="form-error" role="alert" hidden></p>
-        <div class="progress-wrap" id="progress-wrap" hidden aria-live="polite">
-          <div class="progress-label"><span id="progress-copy">准备检查</span><span id="progress-value">0 / 15</span></div>
-          <div class="progress-track" id="progress-track" role="progressbar" aria-label="检查进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-bar" id="progress-bar"></div></div>
-        </div>
-      </form>
-
-      <section class="cases-panel" aria-labelledby="cases-heading">
-        <div class="cases-head">
-          <div>
-            <h2 id="cases-heading">本次测试用例</h2>
-            <p>每个选中路由执行 4 次有效请求和 1 次无效请求；不判断回答质量。</p>
-          </div>
-          <span>5 项 / 路由</span>
-        </div>
-        <ol class="case-list">
-          <li>
-            <div class="case-name"><span>01</span><strong>基础文本</strong></div>
-            <p><small>触发</small>要求模型只回复 <code>pong</code></p>
-            <p><small>通过条件</small>2xx、标准对象类型、assistant 文本非空</p>
-          </li>
-          <li>
-            <div class="case-name"><span>02</span><strong>流式响应</strong></div>
-            <p><small>触发</small>同一文本请求并设置 <code>stream: true</code></p>
-            <p><small>通过条件</small>SSE 类型正确、有文本增量并收到协议终止事件</p>
-          </li>
-          <li>
-            <div class="case-name"><span>03</span><strong>工具调用</strong></div>
-            <p><small>触发</small>强制调用 <code>get_weather(city)</code></p>
-            <p><small>通过条件</small>工具名称正确，参数为合法 JSON 对象</p>
-          </li>
-          <li>
-            <div class="case-name"><span>04</span><strong>Usage 计量</strong></div>
-            <p><small>触发</small>发送一次基础文本请求</p>
-            <p><small>通过条件</small>协议规定的输入、输出和合计 token 字段有效</p>
-          </li>
-          <li>
-            <div class="case-name"><span>05</span><strong>错误响应</strong></div>
-            <p><small>触发</small>发送缺少 <code>model</code> 的空对象 <code>{}</code></p>
-            <p><small>通过条件</small>返回 4xx，且包含非空 <code>error.type</code> 和 <code>error.message</code></p>
-          </li>
-        </ol>
-      </section>
-
-      <section class="empty-state" id="empty-state">
-        <div class="empty-mark">✓</div>
-        <h2>准备开始第一次检查</h2>
-        <p>填写目标服务后运行；每个路由会执行 5 项协议探针。</p>
-      </section>
-
-      <section class="results" id="results" hidden aria-labelledby="results-heading">
-        <div class="results-head">
-          <div class="results-title">
-            <h2 id="results-heading">最近一次结果</h2>
-            <span class="run-meta" id="run-meta"></span>
-          </div>
-          <a class="download" id="download-report" href="#" download>下载 JSON 报告</a>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th>路由</th><th>基础请求</th><th>流式响应</th><th>工具调用</th><th>Usage</th><th>错误格式</th></tr>
-            </thead>
-            <tbody id="result-rows"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="detail" id="detail" hidden aria-live="polite">
-        <div class="detail-title"><span class="status" id="detail-status"></span><h2 id="detail-heading"></h2></div>
-        <p class="detail-copy" id="detail-copy"></p>
-        <p class="expected" id="detail-expected"></p>
-        <div class="exchange">
-          <details><summary>查看请求</summary><pre><code id="detail-request"></code></pre></details>
-          <details><summary>查看响应</summary><pre><code id="detail-response"></code></pre></details>
-        </div>
-      </section>
-    </main>
-  </div>
+        </aside>
+      </div>
+    </section>
+  </main>
   <script src="/app.js" defer></script>
 </body>
 </html>

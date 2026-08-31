@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"strings"
 )
 
@@ -19,11 +20,12 @@ func parseSSE(body []byte) ([]sseEvent, error) {
 	events := make([]sseEvent, 0, 16)
 	current := sseEvent{}
 	flush := func() {
-		if current.Event != "" || current.Data != "" {
-			current.Data = strings.TrimSuffix(current.Data, "\n")
-			events = append(events, current)
-			current = sseEvent{}
+		if current.Event == "" && current.Data == "" {
+			return
 		}
+		current.Data = strings.TrimSuffix(current.Data, "\n")
+		events = append(events, current)
+		current = sseEvent{}
 	}
 	for scanner.Scan() {
 		line := strings.TrimSuffix(scanner.Text(), "\r")
@@ -52,100 +54,302 @@ func parseSSE(body []byte) ([]sseEvent, error) {
 	return events, nil
 }
 
-func (p protocolSpec) validateStream(events []sseEvent) validation {
-	if len(events) == 0 {
-		return validation{Status: StatusFail, Summary: "没有收到任何 SSE 事件。", Expected: "期望：至少收到一个内容事件和一个终止事件。"}
+func (p protocolSpec) validateStreamProbe(builder *assertionBuilder, probe probeResponse) {
+	if probe.Err != nil {
+		builder.check("http.success", false, "transport.or_sse.failed", "HTTP 2xx", probe.Err.Error())
+		builder.check("http.sse", false, "stream.unavailable", "text/event-stream", probe.Headers.Get("Content-Type"))
+		builder.check("sse.syntax", false, "sse.parse.failed", "parseable SSE events", probe.Err.Error())
+		builder.blockUnset("stream.unavailable")
+		return
+	}
+	success := probe.StatusCode >= 200 && probe.StatusCode < 300
+	builder.check("http.success", success, "http.status.not_success", "HTTP 2xx", fmt.Sprintf("HTTP %d", probe.StatusCode))
+	mediaType, _, err := mime.ParseMediaType(probe.Headers.Get("Content-Type"))
+	isSSE := err == nil && mediaType == "text/event-stream"
+	builder.check("http.sse", isSSE, "http.content_type.not_sse", "text/event-stream", probe.Headers.Get("Content-Type"))
+	builder.check("sse.syntax", len(probe.Events) > 0, "sse.events.empty", "one or more SSE events", fmt.Sprintf("%d events", len(probe.Events)))
+	if !success || !isSSE || len(probe.Events) == 0 {
+		builder.blockUnset("stream.unavailable")
+		return
 	}
 	switch p.ID {
 	case RouteChat:
-		seenChunk := false
-		seenContent := false
-		seenDone := false
-		for _, event := range events {
-			if event.Data == "[DONE]" {
-				seenDone = true
+		validateChatStream(builder, probe.Events)
+	case RouteResponses:
+		validateResponsesStream(builder, probe.Events)
+	case RouteMessages:
+		validateMessagesStream(builder, probe.Events)
+	}
+}
+
+func validateChatStream(builder *assertionBuilder, events []sseEvent) {
+	seenChunk := false
+	chunksValid := true
+	seenContent := false
+	seenFinish := false
+	seenDone := false
+	doneIsFinal := true
+	seenUsage := false
+	usageValid := true
+	stableID := ""
+	idValid := true
+
+	for _, event := range events {
+		if event.Data == "[DONE]" {
+			if seenDone {
+				doneIsFinal = false
+			}
+			seenDone = true
+			continue
+		}
+		if event.Data == "" {
+			continue
+		}
+		if seenDone {
+			doneIsFinal = false
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &value); err != nil || value == nil {
+			chunksValid = false
+			continue
+		}
+		seenChunk = true
+		if value["object"] != "chat.completion.chunk" {
+			chunksValid = false
+		}
+		id, ok := nonEmptyString(value["id"])
+		if !ok {
+			idValid = false
+		} else if stableID == "" {
+			stableID = id
+		} else if stableID != id {
+			idValid = false
+		}
+		choices, ok := value["choices"].([]any)
+		if !ok {
+			chunksValid = false
+			continue
+		}
+		for _, rawChoice := range choices {
+			choice, ok := rawChoice.(map[string]any)
+			if !ok {
+				chunksValid = false
 				continue
 			}
-			var value map[string]any
-			if json.Unmarshal([]byte(event.Data), &value) == nil {
-				if _, ok := value["choices"].([]any); ok {
-					seenChunk = true
-					choices, _ := value["choices"].([]any)
-					for _, item := range choices {
-						choice, _ := item.(map[string]any)
-						delta, _ := choice["delta"].(map[string]any)
-						if text, ok := delta["content"].(string); ok && text != "" {
-							seenContent = true
-						}
-					}
-				}
+			if finish, ok := nonEmptyString(choice["finish_reason"]); ok && finish != "null" {
+				seenFinish = true
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if text, ok := delta["content"].(string); ok && text != "" {
+				seenContent = true
 			}
 		}
-		if !seenChunk {
-			return missing("事件流中没有有效的 chat completion chunk。", "期望：data JSON 包含 choices 数组。")
-		}
-		if !seenContent {
-			return missing("事件流中没有文本增量。", "期望：至少有一个 choices[].delta.content 文本片段。")
-		}
-		if !seenDone {
-			return missing("事件流缺少 [DONE] 终止标记。", "期望：Chat Completions 流以 data: [DONE] 结束。")
-		}
-	case RouteResponses:
-		seenCreated := false
-		seenCompleted := false
-		seenContent := false
-		for _, event := range events {
-			typeName := event.Event
-			if typeName == "" {
-				var value map[string]any
-				if json.Unmarshal([]byte(event.Data), &value) == nil {
-					typeName, _ = value["type"].(string)
-				}
+		if rawUsage, exists := value["usage"]; exists && rawUsage != nil {
+			seenUsage = true
+			usage, ok := rawUsage.(map[string]any)
+			if !ok {
+				usageValid = false
+				continue
 			}
-			seenCreated = seenCreated || typeName == "response.created"
-			seenCompleted = seenCompleted || typeName == "response.completed"
-			seenContent = seenContent || typeName == "response.output_text.delta"
-		}
-		if !seenCreated {
-			return missing("事件流缺少 response.created。", "期望：Responses 流包含 response.created 和 response.completed。")
-		}
-		if !seenCompleted {
-			return missing("事件流缺少 response.completed。", "期望：Responses 流以 response.completed 正常完成。")
-		}
-		if !seenContent {
-			return missing("事件流中没有 response.output_text.delta。", "期望：至少有一个输出文本增量事件。")
-		}
-	case RouteMessages:
-		seenStart := false
-		seenStop := false
-		seenContent := false
-		for _, event := range events {
-			typeName := event.Event
-			if typeName == "" {
-				var value map[string]any
-				if json.Unmarshal([]byte(event.Data), &value) == nil {
-					typeName, _ = value["type"].(string)
-				}
-			}
-			seenStart = seenStart || typeName == "message_start"
-			seenStop = seenStop || typeName == "message_stop"
-			if typeName == "content_block_delta" {
-				var value map[string]any
-				if json.Unmarshal([]byte(event.Data), &value) == nil {
-					delta, _ := value["delta"].(map[string]any)
-					seenContent = seenContent || delta["type"] == "text_delta"
-				}
-			}
-		}
-		if !seenStart {
-			return missing("事件流缺少 message_start。", "期望：Messages 流包含 message_start 和 message_stop。")
-		}
-		if !seenStop {
-			return missing("事件流缺少 message_stop。", "期望：Messages 流以 message_stop 正常完成。")
-		}
-		if !seenContent {
-			return missing("事件流中没有 text_delta。", "期望：至少有一个 content_block_delta.text_delta 事件。")
+			prompt, promptOK := integerValue(usage["prompt_tokens"])
+			completion, completionOK := integerValue(usage["completion_tokens"])
+			total, totalOK := integerValue(usage["total_tokens"])
+			usageValid = usageValid && promptOK && completionOK && totalOK && prompt >= 0 && completion >= 0 && total == prompt+completion
 		}
 	}
-	return validation{Status: StatusPass, Summary: fmt.Sprintf("收到 %d 个 SSE 事件且正常结束。", len(events)), Expected: "已验证事件格式、关键事件和终止事件。"}
+
+	builder.check("stream.chunk", seenChunk && chunksValid, "chat.stream.chunk.invalid", "valid chat.completion.chunk JSON events", fmt.Sprintf("%d events", len(events)))
+	builder.check("stream.id", seenChunk && idValid && stableID != "", "chat.stream.id.invalid", "one stable non-empty response ID", stableID)
+	builder.check("stream.content", seenContent, "chat.stream.content.missing", "one or more text deltas", "no non-empty delta.content")
+	builder.check("stream.finish", seenFinish, "chat.stream.finish.missing", "non-empty finish_reason", "not observed")
+	builder.check("stream.done", seenDone && doneIsFinal, "chat.stream.done.invalid", "one final [DONE] event", fmt.Sprintf("seen=%t final=%t", seenDone, doneIsFinal))
+	builder.check("stream.usage", seenUsage && usageValid, "chat.stream.usage.invalid", "one valid final usage object", fmt.Sprintf("seen=%t valid=%t", seenUsage, usageValid))
+}
+
+func validateResponsesStream(builder *assertionBuilder, events []sseEvent) {
+	firstType := ""
+	seenCreated := false
+	seenContent := false
+	seenCompleted := false
+	completedIsFinal := true
+	terminalValid := true
+	jsonValid := true
+	lifecycleValid := true
+	seenItemAdded := false
+	seenPartAdded := false
+	seenItemDone := false
+	seenPartDone := false
+	items := make(map[int]bool)
+	parts := make(map[string]bool)
+	sequenceSeen := false
+	sequenceValid := true
+	var lastSequence int64 = -1
+
+	for _, event := range events {
+		if event.Data == "" {
+			continue
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &value); err != nil || value == nil {
+			jsonValid = false
+			continue
+		}
+		typeName, _ := value["type"].(string)
+		if typeName == "" {
+			typeName = event.Event
+		}
+		if event.Event != "" && typeName != event.Event {
+			jsonValid = false
+		}
+		if firstType == "" && typeName != "" {
+			firstType = typeName
+		}
+		if seenCompleted && typeName != "" {
+			completedIsFinal = false
+		}
+		if sequence, ok := integerValue(value["sequence_number"]); ok {
+			sequenceSeen = true
+			if sequence <= lastSequence {
+				sequenceValid = false
+			}
+			lastSequence = sequence
+		}
+
+		switch typeName {
+		case "response.created":
+			seenCreated = true
+		case "response.output_item.added":
+			index, ok := integerValue(value["output_index"])
+			lifecycleValid = lifecycleValid && ok && index >= 0 && !items[int(index)]
+			items[int(index)] = true
+			seenItemAdded = true
+		case "response.content_part.added":
+			outputIndex, outputOK := integerValue(value["output_index"])
+			contentIndex, contentOK := integerValue(value["content_index"])
+			key := fmt.Sprintf("%d:%d", outputIndex, contentIndex)
+			lifecycleValid = lifecycleValid && outputOK && contentOK && items[int(outputIndex)] && !parts[key]
+			parts[key] = true
+			seenPartAdded = true
+		case "response.output_text.delta":
+			delta, deltaOK := value["delta"].(string)
+			seenContent = seenContent || deltaOK && delta != ""
+			if _, hasOutput := value["output_index"]; hasOutput {
+				outputIndex, outputOK := integerValue(value["output_index"])
+				contentIndex, contentOK := integerValue(value["content_index"])
+				key := fmt.Sprintf("%d:%d", outputIndex, contentIndex)
+				lifecycleValid = lifecycleValid && outputOK && contentOK && parts[key]
+			}
+		case "response.content_part.done":
+			outputIndex, outputOK := integerValue(value["output_index"])
+			contentIndex, contentOK := integerValue(value["content_index"])
+			key := fmt.Sprintf("%d:%d", outputIndex, contentIndex)
+			lifecycleValid = lifecycleValid && outputOK && contentOK && parts[key]
+			delete(parts, key)
+			seenPartDone = true
+		case "response.output_item.done":
+			index, ok := integerValue(value["output_index"])
+			lifecycleValid = lifecycleValid && ok && items[int(index)]
+			delete(items, int(index))
+			seenItemDone = true
+		case "response.completed":
+			seenCompleted = true
+			response, _ := value["response"].(map[string]any)
+			terminalValid = terminalValid && response["status"] == "completed"
+		case "response.failed", "response.incomplete", "response.cancelled", "error":
+			terminalValid = false
+		}
+	}
+
+	lifecycleComplete := jsonValid && lifecycleValid && seenItemAdded && seenPartAdded && seenItemDone && seenPartDone && len(items) == 0 && len(parts) == 0
+	builder.check("stream.created", seenCreated && firstType == "response.created", "responses.stream.created.invalid", "response.created as first event", firstType)
+	builder.check("stream.lifecycle", lifecycleComplete, "responses.stream.lifecycle.incomplete", "balanced output item and content part lifecycle", fmt.Sprintf("item=%t/%t part=%t/%t valid=%t", seenItemAdded, seenItemDone, seenPartAdded, seenPartDone, lifecycleValid))
+	builder.check("stream.content", seenContent, "responses.stream.content.missing", "one or more response.output_text.delta events", "not observed")
+	builder.check("stream.sequence", sequenceSeen && sequenceValid, "responses.stream.sequence.invalid", "strictly increasing sequence_number", fmt.Sprintf("seen=%t valid=%t", sequenceSeen, sequenceValid))
+	builder.check("stream.completed", seenCompleted && completedIsFinal, "responses.stream.completed.invalid", "final response.completed", fmt.Sprintf("seen=%t final=%t", seenCompleted, completedIsFinal))
+	builder.check("stream.terminal", terminalValid, "responses.stream.terminal.failed", "completed terminal response with no error terminal", fmt.Sprintf("valid=%t", terminalValid))
+}
+
+func validateMessagesStream(builder *assertionBuilder, events []sseEvent) {
+	firstType := ""
+	seenStart := false
+	seenStop := false
+	stopIsFinal := true
+	seenContent := false
+	seenUsage := false
+	usageValid := true
+	noError := true
+	blocksValid := true
+	nextIndex := 0
+	active := make(map[int]string)
+
+	for _, event := range events {
+		if event.Data == "" {
+			continue
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(event.Data), &value); err != nil || value == nil {
+			blocksValid = false
+			continue
+		}
+		typeName, _ := value["type"].(string)
+		if typeName == "" {
+			typeName = event.Event
+		}
+		if event.Event != "" && typeName != event.Event {
+			blocksValid = false
+		}
+		if typeName != "ping" && firstType == "" {
+			firstType = typeName
+		}
+		if seenStop && typeName != "ping" {
+			stopIsFinal = false
+		}
+
+		switch typeName {
+		case "message_start":
+			seenStart = true
+		case "content_block_start":
+			index, ok := integerValue(value["index"])
+			contentBlock, _ := value["content_block"].(map[string]any)
+			blockType, _ := contentBlock["type"].(string)
+			intIndex := int(index)
+			blocksValid = blocksValid && ok && intIndex == nextIndex && blockType != "" && active[intIndex] == ""
+			active[intIndex] = blockType
+			nextIndex++
+		case "content_block_delta":
+			index, ok := integerValue(value["index"])
+			blockType := active[int(index)]
+			delta, _ := value["delta"].(map[string]any)
+			deltaType, _ := delta["type"].(string)
+			blocksValid = blocksValid && ok && blockType != "" && deltaType != ""
+			if deltaType == "text_delta" {
+				text, _ := delta["text"].(string)
+				seenContent = seenContent || text != ""
+			}
+		case "content_block_stop":
+			index, ok := integerValue(value["index"])
+			intIndex := int(index)
+			blocksValid = blocksValid && ok && active[intIndex] != ""
+			delete(active, intIndex)
+		case "message_delta":
+			if rawUsage, ok := value["usage"]; ok {
+				seenUsage = true
+				usage, usageOK := rawUsage.(map[string]any)
+				output, outputOK := integerValue(usage["output_tokens"])
+				usageValid = usageValid && usageOK && outputOK && output >= 0
+			}
+		case "message_stop":
+			seenStop = true
+			blocksValid = blocksValid && len(active) == 0
+		case "error":
+			noError = false
+		}
+	}
+
+	builder.check("stream.message_start", seenStart && firstType == "message_start", "messages.stream.start.invalid", "message_start as first non-ping event", firstType)
+	builder.check("stream.blocks", blocksValid && len(active) == 0, "messages.stream.blocks.invalid", "balanced contiguous content block lifecycle", fmt.Sprintf("valid=%t active=%d", blocksValid, len(active)))
+	builder.check("stream.content", seenContent, "messages.stream.content.missing", "one or more non-empty text_delta events", "not observed")
+	builder.check("stream.usage", seenUsage && usageValid, "messages.stream.usage.invalid", "cumulative non-negative message_delta usage", fmt.Sprintf("seen=%t valid=%t", seenUsage, usageValid))
+	builder.check("stream.message_stop", seenStop && stopIsFinal, "messages.stream.stop.invalid", "final message_stop", fmt.Sprintf("seen=%t final=%t", seenStop, stopIsFinal))
+	builder.check("stream.no_error", noError, "messages.stream.error", "no error event", fmt.Sprintf("valid=%t", noError))
 }

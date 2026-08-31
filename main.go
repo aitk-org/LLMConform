@@ -57,6 +57,8 @@ func checkCommand(args []string) error {
 	baseURL := set.String("base-url", os.Getenv("LLMCONFORM_BASE_URL"), "provider base URL")
 	model := set.String("model", os.Getenv("LLMCONFORM_MODEL"), "model name")
 	routes := set.String("routes", "all", "comma-separated routes: chat,responses,messages")
+	profile := set.String("profile", "", "target profile: openai, claude, gateway, custom")
+	level := set.String("level", LevelStandard, "test level: quick, standard, full")
 	format := set.String("format", "table", "output format: table or json")
 	timeout := set.Duration("timeout", 60*time.Second, "timeout for each probe")
 	if err := set.Parse(args); err != nil {
@@ -67,6 +69,8 @@ func checkCommand(args []string) error {
 		BaseURL: *baseURL,
 		APIKey:  os.Getenv("LLMCONFORM_API_KEY"),
 		Model:   *model,
+		Profile: *profile,
+		Level:   *level,
 		Routes:  splitRoutes(*routes),
 		Timeout: *timeout,
 	}
@@ -110,7 +114,7 @@ func printUsage() {
 
 Usage:
   llmconform serve [--addr 127.0.0.1:8080]
-  llmconform check --base-url URL --model MODEL [--routes all] [--format table|json]
+	llmconform check --base-url URL --model MODEL [--profile gateway] [--level standard] [--routes all] [--format table|json]
 
 Environment:
   LLMCONFORM_API_KEY   API key used for checks
